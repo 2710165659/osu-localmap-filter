@@ -1,0 +1,112 @@
+name: Build And Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout LocalMapFilter
+        uses: actions/checkout@v4
+        with:
+          path: osu-localmap-filter
+          fetch-depth: 0
+
+      - name: Checkout osu!
+        uses: actions/checkout@v4
+        with:
+          repository: ppy/osu
+          path: osu
+          fetch-depth: 1
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore and build
+        shell: pwsh
+        run: >
+          dotnet build
+          "$env:GITHUB_WORKSPACE\osu-localmap-filter\osu.Game.Rulesets.LocalMapFilter\osu.Game.Rulesets.LocalMapFilter.csproj"
+          -c Release
+          --nologo
+
+      - name: Package DLL
+        id: package
+        shell: pwsh
+        run: |
+          $dllPath = "$env:GITHUB_WORKSPACE\osu-localmap-filter\osu.Game.Rulesets.LocalMapFilter\bin\Release\net8.0\osu.Game.Rulesets.LocalMapFilter.dll"
+          if (!(Test-Path $dllPath)) {
+            throw "DLL not found: $dllPath"
+          }
+
+          $packageRoot = "$env:RUNNER_TEMP\localmapfilter-package"
+          $zipPath = "$env:RUNNER_TEMP\osu.Game.Rulesets.LocalMapFilter.zip"
+
+          if (Test-Path $packageRoot) {
+            Remove-Item $packageRoot -Recurse -Force
+          }
+
+          if (Test-Path $zipPath) {
+            Remove-Item $zipPath -Force
+          }
+
+          New-Item -ItemType Directory -Path $packageRoot | Out-Null
+          Copy-Item $dllPath -Destination "$packageRoot\osu.Game.Rulesets.LocalMapFilter.dll"
+          Compress-Archive -Path "$packageRoot\osu.Game.Rulesets.LocalMapFilter.dll" -DestinationPath $zipPath -CompressionLevel Optimal
+
+          "zip_path=$zipPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Prepare release metadata
+        id: release_meta
+        shell: pwsh
+        run: |
+          $buildTimeUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss 'UTC'")
+          "build_time_utc=$buildTimeUtc" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Recreate rolling release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view auto-build *> $null
+          $releaseExists = $LASTEXITCODE -eq 0
+          $global:LASTEXITCODE = 0
+
+          if ($releaseExists) {
+            gh release delete auto-build --cleanup-tag --yes
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Failed to delete existing auto-build release."
+            }
+
+            $global:LASTEXITCODE = 0
+          }
+
+      - name: Publish rolling release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: auto-build
+          name: Auto Build (${{ steps.release_meta.outputs.build_time_utc }})
+          prerelease: false
+          make_latest: true
+          generate_release_notes: false
+          overwrite_files: true
+          body: |
+            Build time: `${{ steps.release_meta.outputs.build_time_utc }}`
+
+            Automated build from `${{ github.sha }}`.
+
+            Source branch: `${{ github.ref_name }}`
+          files: |
+            ${{ steps.package.outputs.zip_path }}

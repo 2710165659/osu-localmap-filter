@@ -14,7 +14,6 @@ using osu.Game.Overlays;
 using osu.Game.Overlays.BeatmapListing;
 using osu.Game.Overlays.Toolbar;
 using osu.Game.Rulesets;
-using osu.Game.Rulesets.LocalMapFilter.Configuration;
 using osu.Game.Rulesets.LocalMapFilter.Features.Injection;
 
 namespace osu.Game.Rulesets.LocalMapFilter.Features.BeatmapListing;
@@ -23,67 +22,106 @@ public partial class LocalBeatmapListingInterceptor : AbstractHandler
 {
     private static readonly BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
     private static readonly PropertyInfo? internalChildrenProperty = typeof(CompositeDrawable).GetProperty("InternalChildren", flags);
+    private static readonly EventInfo? childBecameAliveEvent = typeof(CompositeDrawable).GetEvent("ChildBecameAlive", flags);
+    private static readonly EventInfo? childDiedEvent = typeof(CompositeDrawable).GetEvent("ChildDied", flags);
     private static readonly MethodInfo? queueUpdateSearchMethod = typeof(BeatmapListingFilterControl).GetMethod("queueUpdateSearch", flags);
     private static readonly PropertyInfo? currentPageProperty = typeof(BeatmapListingFilterControl).GetProperty(nameof(BeatmapListingFilterControl.CurrentPage), flags);
     private static readonly FieldInfo? searchControlField = typeof(BeatmapListingFilterControl).GetField("searchControl", flags);
     private static readonly FieldInfo? explicitContentFilterField = typeof(BeatmapListingSearchControl).GetField("explicitContentFilter", flags);
     private static readonly FieldInfo? activationRequestedField = typeof(TabItem<RulesetInfo>).GetField("ActivationRequested", flags);
-    private static readonly FieldInfo? beatmapListingOverlayField = typeof(OsuGame).GetField("beatmapListing", flags);
     private const float outer_flow_spacing = 20;
     private const float inner_flow_spacing = 5;
 
     [Resolved(canBeNull: true)]
     private BeatmapManager? beatmapManager { get; set; }
 
-    [Resolved(canBeNull: true)]
-    private IRulesetConfigCache? rulesetConfigCache { get; set; }
-
-    [Resolved(canBeNull: true)]
-    private BeatmapListingOverlay? beatmapListingOverlay { get; set; }
-
-    private Bindable<bool>? hideLocalBeatmaps;
-
+    private readonly Dictionary<CompositeDrawable, CompositeObserver> compositeObservers = new(ReferenceEqualityComparer.Instance);
     private readonly Dictionary<BeatmapListingOverlay, OverlayPatchState> patchedOverlays = new(ReferenceEqualityComparer.Instance);
     private readonly Dictionary<ToolbarRulesetTabButton, ToolbarPatchState> patchedToolbarButtons = new(ReferenceEqualityComparer.Instance);
-
-    [BackgroundDependencyLoader]
-    private void load()
-    {
-        hideLocalBeatmaps = resolveHideLocalBeatmapsBindable();
-    }
+    private readonly Bindable<bool> hideLocalBeatmaps = new(false);
 
     protected override void LoadComplete()
     {
         base.LoadComplete();
-
-        Schedule(() => patchBeatmapListingOverlayWhenAvailable());
-
-        if (Game.Toolbar != null)
-        {
-            foreach (ToolbarRulesetTabButton toolbarButton in findDescendants<ToolbarRulesetTabButton>(Game.Toolbar))
-                patchToolbarButton(toolbarButton);
-        }
+        attachSubtree(Game);
     }
 
-    private void patchBeatmapListingOverlayWhenAvailable(int attempt = 0)
+    private void attachSubtree(Drawable root)
     {
-        BeatmapListingOverlay? overlay = beatmapListingOverlay
-                                         ?? beatmapListingOverlayField?.GetValue(Game) as BeatmapListingOverlay
-                                         ?? findDescendants<BeatmapListingOverlay>(Game).FirstOrDefault();
+        var stack = new Stack<Drawable>();
+        stack.Push(root);
 
-        if (overlay != null)
+        while (stack.Count > 0)
         {
-            patchOverlay(overlay);
-            return;
+            Drawable current = stack.Pop();
+            inspectDrawable(current);
+
+            if (current is not CompositeDrawable composite)
+                continue;
+
+            ensureCompositeObserver(composite);
+            pushChildren(composite, stack);
         }
-
-        if (attempt >= 50)
-            return;
-
-        Scheduler.AddDelayed(() => patchBeatmapListingOverlayWhenAvailable(attempt + 1), 100);
     }
 
-    private void patchOverlay(BeatmapListingOverlay overlay, int attempt = 0)
+    private void detachSubtree(Drawable root)
+    {
+        var stack = new Stack<Drawable>();
+        stack.Push(root);
+
+        while (stack.Count > 0)
+        {
+            Drawable current = stack.Pop();
+
+            if (current is CompositeDrawable composite)
+            {
+                removeCompositeObserver(composite);
+                pushChildren(composite, stack);
+            }
+
+            cleanupDrawable(current);
+        }
+    }
+
+    private void inspectDrawable(Drawable drawable)
+    {
+        if (drawable is BeatmapListingOverlay overlay)
+            Schedule(() => patchOverlay(overlay));
+
+        if (drawable is ToolbarRulesetTabButton toolbarButton)
+            Schedule(() => patchToolbarButton(toolbarButton));
+    }
+
+    private void cleanupDrawable(Drawable drawable)
+    {
+        if (drawable is BeatmapListingOverlay overlay)
+            restoreOverlayPatch(overlay);
+
+        if (drawable is ToolbarRulesetTabButton toolbarButton)
+            restoreToolbarButton(toolbarButton);
+    }
+
+    private void onChildBecameAlive(Drawable child) => attachSubtree(child);
+
+    private void onChildDied(Drawable child) => detachSubtree(child);
+
+    private void ensureCompositeObserver(CompositeDrawable composite)
+    {
+        if (compositeObservers.ContainsKey(composite))
+            return;
+
+        compositeObservers[composite] = new CompositeObserver(composite, onChildBecameAlive, onChildDied);
+    }
+
+    private void removeCompositeObserver(CompositeDrawable composite)
+    {
+        if (!compositeObservers.Remove(composite, out CompositeObserver? observer))
+            return;
+
+        observer.Dispose();
+    }
+
+    private void patchOverlay(BeatmapListingOverlay overlay)
     {
         try
         {
@@ -91,15 +129,6 @@ public partial class LocalBeatmapListingInterceptor : AbstractHandler
                 return;
 
             BeatmapListingFilterControl filterControl = overlay.Header.FilterControl;
-
-            if (filterControl.SearchStarted == null || filterControl.SearchFinished == null)
-            {
-                if (attempt >= 50)
-                    return;
-
-                Scheduler.AddDelayed(() => patchOverlay(overlay, attempt + 1), 100);
-                return;
-            }
 
             var state = new OverlayPatchState(overlay, filterControl, hideLocalBeatmaps)
             {
@@ -111,7 +140,7 @@ public partial class LocalBeatmapListingInterceptor : AbstractHandler
             state.WrappedSearchStarted = () =>
             {
                 state.IsAwaitingFirstVisibleResults = true;
-                ensureToggleInserted(state);
+                tryInsertToggle(state);
                 state.OriginalSearchStarted?.Invoke();
             };
 
@@ -121,7 +150,7 @@ public partial class LocalBeatmapListingInterceptor : AbstractHandler
             filterControl.SearchFinished = state.WrappedSearchFinished;
 
             patchedOverlays[overlay] = state;
-            ensureToggleInserted(state);
+            tryInsertToggle(state);
         }
         catch (Exception ex)
         {
@@ -143,28 +172,9 @@ public partial class LocalBeatmapListingInterceptor : AbstractHandler
         state.Dispose();
     }
 
-    private void ensureToggleInserted(OverlayPatchState state, int attempt = 0)
-    {
-        if (state.IsDisposed || state.ToggleRow != null)
-            return;
-
-        if (tryInsertToggle(state))
-            return;
-
-        if (attempt >= 20)
-            return;
-
-        Scheduler.AddDelayed(() => ensureToggleInserted(state, attempt + 1), 100);
-    }
-
     private bool tryInsertToggle(OverlayPatchState state)
     {
-        var toggleBindable = state.ToggleBindable ?? resolveHideLocalBeatmapsBindable();
-
-        if (toggleBindable == null)
-            return false;
-
-        state.ToggleBindable = toggleBindable;
+        var toggleBindable = state.ToggleBindable;
 
         if (state.ToggleRow != null)
             return true;
@@ -205,26 +215,6 @@ public partial class LocalBeatmapListingInterceptor : AbstractHandler
         return true;
     }
 
-    private Bindable<bool>? resolveHideLocalBeatmapsBindable()
-    {
-        if (hideLocalBeatmaps != null)
-            return hideLocalBeatmaps;
-
-        if (LocalMapFilterRulesetConfigManager.Instance != null)
-            return hideLocalBeatmaps = LocalMapFilterRulesetConfigManager.Instance.GetHideLocalBeatmapsBindable();
-
-        try
-        {
-            hideLocalBeatmaps = (rulesetConfigCache?.GetConfigFor(new LocalMapFilterRuleset()) as LocalMapFilterRulesetConfigManager)?.GetHideLocalBeatmapsBindable();
-        }
-        catch (Exception ex)
-        {
-            LocalMapFilterLogging.LogError(ex, "Failed to retrieve ruleset config for beatmap listing toggle.");
-        }
-
-        return hideLocalBeatmaps;
-    }
-
     private void patchToolbarButton(ToolbarRulesetTabButton toolbarButton)
     {
         if (patchedToolbarButtons.ContainsKey(toolbarButton))
@@ -260,9 +250,7 @@ public partial class LocalBeatmapListingInterceptor : AbstractHandler
             return;
         }
 
-        var toggleBindable = state.ToggleBindable ?? resolveHideLocalBeatmapsBindable();
-
-        if (toggleBindable?.Value != true || beatmapManager == null)
+        if (state.ToggleBindable.Value != true || beatmapManager == null)
         {
             state.IsAwaitingFirstVisibleResults = false;
             state.OriginalSearchFinished?.Invoke(result);
@@ -387,6 +375,11 @@ public partial class LocalBeatmapListingInterceptor : AbstractHandler
     {
         base.Dispose(isDisposing);
 
+        foreach (CompositeObserver observer in compositeObservers.Values)
+            observer.Dispose();
+
+        compositeObservers.Clear();
+
         foreach (BeatmapListingOverlay overlay in patchedOverlays.Keys.ToList())
             restoreOverlayPatch(overlay);
 
@@ -398,7 +391,7 @@ public partial class LocalBeatmapListingInterceptor : AbstractHandler
     {
         public readonly BeatmapListingOverlay Overlay;
         public readonly BeatmapListingFilterControl FilterControl;
-        public Bindable<bool>? ToggleBindable;
+        public Bindable<bool> ToggleBindable;
 
         public Action? OriginalSearchStarted;
         public Action? WrappedSearchStarted;
@@ -408,7 +401,7 @@ public partial class LocalBeatmapListingInterceptor : AbstractHandler
         public Drawable? ToggleRow;
         public bool IsDisposed;
 
-        public OverlayPatchState(BeatmapListingOverlay overlay, BeatmapListingFilterControl filterControl, Bindable<bool>? toggleBindable)
+        public OverlayPatchState(BeatmapListingOverlay overlay, BeatmapListingFilterControl filterControl, Bindable<bool> toggleBindable)
         {
             Overlay = overlay;
             FilterControl = filterControl;
@@ -426,5 +419,52 @@ public partial class LocalBeatmapListingInterceptor : AbstractHandler
     {
         public bool WasEnabled;
         public object? OriginalActivationRequested;
+    }
+
+    private sealed class CompositeObserver : IDisposable
+    {
+        private readonly CompositeDrawable composite;
+        private readonly Delegate? childBecameAliveHandler;
+        private readonly Delegate? childDiedHandler;
+
+        public CompositeObserver(CompositeDrawable composite, Action<Drawable> childBecameAlive, Action<Drawable> childDied)
+        {
+            this.composite = composite;
+            childBecameAliveHandler = createHandler(childBecameAliveEvent, childBecameAlive);
+            childDiedHandler = createHandler(childDiedEvent, childDied);
+
+            addHandler(childBecameAliveEvent, childBecameAliveHandler);
+            addHandler(childDiedEvent, childDiedHandler);
+        }
+
+        public void Dispose()
+        {
+            removeHandler(childBecameAliveEvent, childBecameAliveHandler);
+            removeHandler(childDiedEvent, childDiedHandler);
+        }
+
+        private Delegate? createHandler(EventInfo? eventInfo, Action<Drawable> callback)
+        {
+            if (eventInfo?.EventHandlerType == null)
+                return null;
+
+            return Delegate.CreateDelegate(eventInfo.EventHandlerType, callback.Target, callback.Method, false);
+        }
+
+        private void addHandler(EventInfo? eventInfo, Delegate? handler)
+        {
+            if (eventInfo?.GetAddMethod(true) == null || handler == null)
+                return;
+
+            eventInfo.GetAddMethod(true)!.Invoke(composite, new object?[] { handler });
+        }
+
+        private void removeHandler(EventInfo? eventInfo, Delegate? handler)
+        {
+            if (eventInfo?.GetRemoveMethod(true) == null || handler == null)
+                return;
+
+            eventInfo.GetRemoveMethod(true)!.Invoke(composite, new object?[] { handler });
+        }
     }
 }

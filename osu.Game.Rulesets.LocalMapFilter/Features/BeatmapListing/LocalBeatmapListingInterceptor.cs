@@ -12,7 +12,6 @@ using osu.Game.Beatmaps;
 using osu.Game.Graphics.UserInterfaceV2;
 using osu.Game.Overlays;
 using osu.Game.Overlays.BeatmapListing;
-using osu.Game.Online.API.Requests.Responses;
 using osu.Game.Overlays.Toolbar;
 using osu.Game.Rulesets;
 using osu.Game.Rulesets.LocalMapFilter.Features.Injection;
@@ -304,7 +303,7 @@ public partial class LocalBeatmapListingInterceptor : AbstractHandler
 
             if (!cache.TryGetValue(beatmapSet.OnlineID, out bool isLocal))
             {
-                isLocal = beatmapManager!.IsAvailableLocally(new APIBeatmap { OnlineID = beatmapSet.OnlineID });
+                isLocal = beatmapSet.Beatmaps.Any(beatmapManager!.IsAvailableLocally);
                 cache[beatmapSet.OnlineID] = isLocal;
             }
 
